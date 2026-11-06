@@ -1,0 +1,61 @@
+name: Sync Upstream and Build
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  sync-and-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - name: Checkout your fork
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Sync upstream
+        id: sync
+        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4.3
+        with:
+          upstream_sync_repo: czg86389-hub/muse2api
+          upstream_sync_branch: main
+          target_sync_branch: main
+          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
+          test_mode: false
+
+      - name: Decide whether to build
+        id: decide
+        run: |
+          if [ "${{ steps.sync.outputs.has_new_commits }}" = "true" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "build=true" >> $GITHUB_OUTPUT
+          else
+            echo "build=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout latest after sync
+        if: steps.decide.outputs.build == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Log in to GHCR
+        if: steps.decide.outputs.build == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        if: steps.decide.outputs.build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository }}:latest
