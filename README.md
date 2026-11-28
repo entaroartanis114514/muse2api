@@ -161,6 +161,48 @@ Extension 1.0.3 requires a manual reload in every browser profile. Update checks
    }
    ```
 
+### 小内存 VPS / 前置网关部署要点（Small VPS & front-key notes）
+
+以下来自一台 2 vCPU / 2 GB 内存 VPS 上的实测（v1.6.12，systemd 裸机部署）。
+
+- **服务只听 `127.0.0.1`，对外套一层独立的前置 key。** 管理接口和 `/v1` 共用 `MUSE2API_KEY`，发给下游就等于交出管理权。反代校验下游的前置 key，再换成内部 key 转发；只放 `/v1/*`，生成的媒体 `/v1/media/*` 免 key，其余一律 404。Caddy 示例（两把 key 从环境变量读，文件里不写密钥）：
+  ```caddyfile
+  api.example.com {
+    @media {
+      method GET HEAD
+      path /v1/media/*
+    }
+    handle @media {
+      reverse_proxy 127.0.0.1:18610
+    }
+    @authed {
+      path /v1/*
+      header Authorization "Bearer {$MUSE_FRONT_KEY}"
+    }
+    handle @authed {
+      reverse_proxy 127.0.0.1:18610 {
+        header_up Authorization "Bearer {$MUSE2API_KEY}"
+        flush_interval -1
+        transport http {
+          read_timeout 720s
+        }
+      }
+    }
+    handle {
+      respond 404
+    }
+  }
+  ```
+  管理页走 SSH 隧道：`ssh -L 18610:127.0.0.1:18610 <服务器>`，再开 `http://127.0.0.1:18610/admin`。
+- **管理页不要用 `?key=` 打开。** 直接开 `/admin`，在页面的 API Key 输入框里粘贴即可（保存在本机浏览器）。带 `?key=` 的地址会原样写进 uvicorn 访问日志（journald / `docker logs`）、反代日志和浏览器历史。
+- **参考图是本服务自己生成的媒体时，用 data URL 传。** 参考图 URL 只允许公网地址（防 SSRF），所以把 `http://127.0.0.1:18610/v1/media/xxx.webp` 或内网地址当 `image_url` 传给 `/v1/videos` 会被拒绝。先下载再转成 `data:image/webp;base64,...` 传；只有可信的单用户部署才考虑 `MUSE2API_REF_IMAGE_PRIVATE_FETCH=1`。
+- **`POST /v1/images/tasks` 返回 HTTP 202 是正常受理**，按下文「v1.5.2」一节轮询；`POST /v1/videos` 返回 200 和 `status: queued`，同样轮询 `GET /v1/videos/{id}`。
+- **并发要按账号数和内存定。** 没设置 `MUSE2API_CONCURRENCY` 时 `config.py` 的默认值是 8（`.env.example` 写的是 2）。每次对话或生成都要独占一个账号，所以只有一个账号时并发设多少都是串行，调大只会多占内存。2 GB 机器上服务（含 Chromium）空闲约 600 MB，对话 + 生图 + 文生视频一轮峰值约 870 MB：建议设为 `1`，加 swap，并在 systemd 里设 `OOMScoreAdjust=600`、`MemoryHigh=`（内存紧张时先回收、必要时先杀本服务，而不是 sshd 等关键进程）。
+- **锁定版本部署时设 `MUSE2API_MANAGED_DEPLOYMENT=1`**：管理页的一键升级会拒绝执行（409），升级改为人工 `git checkout <commit>`、读 diff、重启。
+- **`usage` 恒为 0**：muse.ai 网页不返回 token 数。需要计量时在网关侧按请求计数，或定期读 `POST /admin/accounts/{id}/quota` 的周额度百分比（约 8 秒，会占用生成锁，别频繁调）。
+
+> English summary: bind to 127.0.0.1 and put a reverse proxy in front that checks a separate front key and swaps it for `MUSE2API_KEY` (the admin key); open `/admin` without `?key=` (it lands in access logs) and paste the key into the page; pass self-hosted reference images as data URLs (private/loopback URLs are rejected by design); `202` from `/v1/images/tasks` means accepted, poll it; with one account, concurrency > 1 only costs memory (code default is 8 when unset); set `MUSE2API_MANAGED_DEPLOYMENT=1` for pinned deployments; `usage` is always 0, meter elsewhere.
+
 ---
 
 ## 🧩 账号导入（Chrome 扩展 / 油猴脚本）
@@ -427,6 +469,7 @@ Nginx 反代需把 `client_max_body_size` 调到 200M 左右，否则大素材�
 | `MUSE2API_VIDEO_HEDGE_LEASE_TIMEOUT` | `5` | 第二路等待空闲账号的最长秒数，等不到就只跑一路 |
 | `MUSE2API_REF_IMAGE_LOCAL_FILES` | `0` | 默认禁止读取服务器本地路径；仅可信单用户部署可显式设为 `1` 恢复 |
 | `MUSE2API_REF_IMAGE_PRIVATE_FETCH` | `0` | 默认仅允许公网 URL，并逐跳检查 DNS/重定向、固定已检查 IP、不使用环境代理；显式设为 `1` 才允许私网/本机 URL |
+| `MUSE2API_ESTIMATE_USAGE` | `0` | 对话接口（chat / responses）的 `usage` 默认全 0（muse.ai 网页不给 token 数）；设为 `1` 时按字符粗估（CJK 每字 1，其余每 4 字符 1），并加响应头 `X-Muse2api-Usage: estimated`。只是估算，不是上游计量 |
 
 两个开关默认均为 `0`：所有生图、图像编辑、图片任务及视频接口都禁止服务器本地路径和私网/本机 URL。Data URL、有效 Base64 和公网 URL 正常使用。只有确认调用方可信且确有需要时，才显式设为 `1` 恢复对应旧能力。
 策略拒绝、下载失败、MIME 或大小不合规都会在提交任务前返回 HTTP 400，不会创建一个随后才失败的后台任务。
@@ -460,12 +503,12 @@ python tests/test_ref_image_safety.py
 - 🌟 **[@Yeadon8888](https://github.com/Yeadon8888)** (PR [#32](https://github.com/czg86389-hub/muse2api/pull/32)) —— 增加有序多参考图生图、编辑与图生视频支持
 - 🌟 **[@pandalaohe](https://github.com/pandalaohe)** (PR [#24](https://github.com/czg86389-hub/muse2api/pull/24)) —— 提供参考图本地文件与私网 URL 安全策略、重定向复查和 DNS 重绑定防护
 - 🌟 **[@QuartzWarrior](https://github.com/QuartzWarrior)** (PR [#25](https://github.com/czg86389-hub/muse2api/pull/25)) —— 贡献账号独立 HTTP 代理基础、认证转接、配置界面与隔离回归测试
-- [@Roins-hub](https://github.com/Roins-hub)：新版 Muse 输入区兼容、视频/音频/文档参考素材（PR #40）。
-
-- [@WXJJ0520](https://github.com/WXJJ0520)：限定当前输入区域的发送按钮，修复侧栏历史误匹配并增加真实 Chromium 回归（PR [#48](https://github.com/czg86389-hub/muse2api/pull/48)）。
-
-- [@Yeadon8888](https://github.com/Yeadon8888)：保留未分配会话响应中的 Cookie 轮换，避免后续继续使用失效旧值（PR [#60](https://github.com/czg86389-hub/muse2api/pull/60)）。
-- [@ALight777](https://github.com/ALight777)：当前窗口 Cookie 存储区隔离、独立排队预算、真实版本报告与只读更新检查、视频缩略图（PR [#58](https://github.com/czg86389-hub/muse2api/pull/58)、[#55](https://github.com/czg86389-hub/muse2api/pull/55)、[#57](https://github.com/czg86389-hub/muse2api/pull/57)、[#51](https://github.com/czg86389-hub/muse2api/pull/51)）。
+- 🌟 **[@Roins-hub](https://github.com/Roins-hub)** (PR [#40](https://github.com/czg86389-hub/muse2api/pull/40)) —— 新版 Muse 输入区兼容、视频/音频/文档参考素材支持
+- 🌟 **[@WXJJ0520](https://github.com/WXJJ0520)** (PR [#48](https://github.com/czg86389-hub/muse2api/pull/48)) —— 限定当前输入区域的发送按钮，修复侧栏历史误匹配并增加真实 Chromium 回归
+- 🌟 **[@Yeadon8888](https://github.com/Yeadon8888)** (PR [#60](https://github.com/czg86389-hub/muse2api/pull/60)) —— 保留未分配会话响应中的 Cookie 轮换，避免后续继续使用失效旧值
+- 🌟 **[@ALight777](https://github.com/ALight777)** (PR [#51](https://github.com/czg86389-hub/muse2api/pull/51), [#55](https://github.com/czg86389-hub/muse2api/pull/55), [#57](https://github.com/czg86389-hub/muse2api/pull/57), [#58](https://github.com/czg86389-hub/muse2api/pull/58)) —— 当前窗口 Cookie 存储区隔离、独立排队预算、真实版本报告与只读更新检查、视频缩略图
+- 🌟 **[@Aster110](https://github.com/Aster110)** (PR [#66](https://github.com/czg86389-hub/muse2api/pull/66), [#67](https://github.com/czg86389-hub/muse2api/pull/67)) —— 补充小内存 VPS 与前置双 Key 网关部署要点，新增可选的对话用量估算（`MUSE2API_ESTIMATE_USAGE`）及离线单测
+- 🌟 **[@hikenshi](https://github.com/hikenshi)** (Issue [#68](https://github.com/czg86389-hub/muse2api/issues/68)) —— 排查并定位 Docker 环境下 Chromium / `chrome_crashpad` 僵尸进程累积问题并提供根因修复方案
 
 欢迎大家提交 PR 与 Issue，共同把项目打磨得更强更好用！
 
